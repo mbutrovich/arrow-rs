@@ -23,12 +23,12 @@ use crate::column::page::PageIterator;
 use crate::data_type::{DataType, Int96};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
-use arrow_array::Decimal256Array;
+use arrow_array::builder::TimestampNanosecondBufferBuilder;
 use arrow_array::{
-    builder::TimestampNanosecondBufferBuilder, ArrayRef, BooleanArray, Decimal128Array,
-    Float32Array, Float64Array, Int32Array, Int64Array, TimestampNanosecondArray, UInt32Array,
-    UInt64Array,
+    ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
+    TimestampNanosecondArray, UInt32Array, UInt64Array,
 };
+use arrow_array::{Decimal256Array, FixedSizeBinaryArray};
 use arrow_buffer::{i256, BooleanBuffer, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType as ArrowType, TimeUnit};
@@ -162,7 +162,10 @@ where
             PhysicalType::DOUBLE => ArrowType::Float64,
             PhysicalType::INT96 => match target_type {
                 ArrowType::Timestamp(TimeUnit::Nanosecond, _) => target_type.clone(),
-                _ => unreachable!("INT96 must be timestamp nanosecond"),
+                ArrowType::FixedSizeBinary(12) => target_type.clone(),
+                _ => unreachable!(
+                    "INT96 must be Timestamp(TimeUnit::Nanosecond,_) or FixedSizeBinary(12)"
+                ),
             },
             PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
                 unreachable!("PrimitiveArrayReaders don't support complex physical types");
@@ -172,7 +175,19 @@ where
         // Convert to arrays by using the Parquet physical type.
         // The physical types are then cast to Arrow types if necessary
 
-        let record_data = self.record_reader.consume_record_data().into_buffer();
+        let record_data: Buffer = if T::get_physical_type() == PhysicalType::INT96
+            && *target_type == ArrowType::FixedSizeBinary(12)
+        {
+            let record_vec: Vec<<T as DataType>::T> = self.record_reader.consume_record_data();
+            let new_len = record_vec.len() * 12;
+            unsafe {
+                let mut data = std::mem::transmute::<Vec<_>, Vec<u8>>(record_vec);
+                data.set_len(new_len);
+                data.into_buffer()
+            }
+        } else {
+            self.record_reader.consume_record_data().into_buffer()
+        };
 
         let array_data = ArrayDataBuilder::new(arrow_data_type)
             .len(self.record_reader.num_values())
@@ -194,7 +209,15 @@ where
             },
             PhysicalType::FLOAT => Arc::new(Float32Array::from(array_data)),
             PhysicalType::DOUBLE => Arc::new(Float64Array::from(array_data)),
-            PhysicalType::INT96 => Arc::new(TimestampNanosecondArray::from(array_data)),
+            PhysicalType::INT96 => match target_type {
+                ArrowType::Timestamp(TimeUnit::Nanosecond, _) => {
+                    Arc::new(TimestampNanosecondArray::from(array_data))
+                }
+                ArrowType::FixedSizeBinary(12) => Arc::new(FixedSizeBinaryArray::from(array_data)),
+                _ => unreachable!(
+                    "INT96 must be Timestamp(TimeUnit::Nanosecond,_) or FixedSizeBinary(12)"
+                ),
+            },
             PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
                 unreachable!("PrimitiveArrayReaders don't support complex physical types");
             }
