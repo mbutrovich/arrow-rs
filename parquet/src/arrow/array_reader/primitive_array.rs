@@ -20,13 +20,13 @@ use crate::arrow::record_reader::RecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::Type as PhysicalType;
 use crate::column::page::PageIterator;
-use crate::column::writer::encoder::ColumnValues;
 use crate::data_type::{DataType, Int96};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
-use arrow_array::builder::TimestampNanosecondBuilder;
-use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array};
+use arrow_array::{
+    builder::TimestampNanosecondBuilder, cast::AsArray, Array, ArrayRef, BooleanArray,
+    Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array,
+};
 use arrow_array::{Decimal256Array, FixedSizeBinaryArray};
 use arrow_buffer::{i256, BooleanBuffer, Buffer};
 use arrow_data::ArrayDataBuilder;
