@@ -20,14 +20,13 @@ use crate::arrow::record_reader::RecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::Type as PhysicalType;
 use crate::column::page::PageIterator;
+use crate::column::writer::encoder::ColumnValues;
 use crate::data_type::{DataType, Int96};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
-use arrow_array::builder::TimestampNanosecondBufferBuilder;
-use arrow_array::{
-    ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    TimestampNanosecondArray, UInt32Array, UInt64Array,
-};
+use arrow_array::builder::TimestampNanosecondBuilder;
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array};
 use arrow_array::{Decimal256Array, FixedSizeBinaryArray};
 use arrow_buffer::{i256, BooleanBuffer, Buffer};
 use arrow_data::ArrayDataBuilder;
@@ -59,11 +58,14 @@ impl IntoBuffer for Vec<bool> {
 
 impl IntoBuffer for Vec<Int96> {
     fn into_buffer(self) -> Buffer {
-        let mut builder = TimestampNanosecondBufferBuilder::new(self.len());
-        for v in self {
-            builder.append(v.to_nanos())
+        let new_len = self.len() * 12;
+        let mut data: Vec<u8>;
+        //TODO: Is there a more idiomatic zero-copy way to do this?
+        unsafe {
+            data = std::mem::transmute::<Vec<Int96>, Vec<u8>>(self);
+            data.set_len(new_len);
         }
-        builder.finish()
+        data.into_buffer()
     }
 }
 
@@ -160,13 +162,7 @@ where
             }
             PhysicalType::FLOAT => ArrowType::Float32,
             PhysicalType::DOUBLE => ArrowType::Float64,
-            PhysicalType::INT96 => match target_type {
-                ArrowType::Timestamp(TimeUnit::Nanosecond, _) => target_type.clone(),
-                ArrowType::FixedSizeBinary(12) => target_type.clone(),
-                _ => unreachable!(
-                    "INT96 must be Timestamp(TimeUnit::Nanosecond,_) or FixedSizeBinary(12)"
-                ),
-            },
+            PhysicalType::INT96 => ArrowType::FixedSizeBinary(12),
             PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
                 unreachable!("PrimitiveArrayReaders don't support complex physical types");
             }
@@ -175,19 +171,7 @@ where
         // Convert to arrays by using the Parquet physical type.
         // The physical types are then cast to Arrow types if necessary
 
-        let record_data: Buffer = if T::get_physical_type() == PhysicalType::INT96
-            && *target_type == ArrowType::FixedSizeBinary(12)
-        {
-            let record_vec: Vec<<T as DataType>::T> = self.record_reader.consume_record_data();
-            let new_len = record_vec.len() * 12;
-            unsafe {
-                let mut data = std::mem::transmute::<Vec<_>, Vec<u8>>(record_vec);
-                data.set_len(new_len);
-                data.into_buffer()
-            }
-        } else {
-            self.record_reader.consume_record_data().into_buffer()
-        };
+        let record_data = self.record_reader.consume_record_data().into_buffer();
 
         let array_data = ArrayDataBuilder::new(arrow_data_type)
             .len(self.record_reader.num_values())
@@ -209,15 +193,7 @@ where
             },
             PhysicalType::FLOAT => Arc::new(Float32Array::from(array_data)),
             PhysicalType::DOUBLE => Arc::new(Float64Array::from(array_data)),
-            PhysicalType::INT96 => match target_type {
-                ArrowType::Timestamp(TimeUnit::Nanosecond, _) => {
-                    Arc::new(TimestampNanosecondArray::from(array_data))
-                }
-                ArrowType::FixedSizeBinary(12) => Arc::new(FixedSizeBinaryArray::from(array_data)),
-                _ => unreachable!(
-                    "INT96 must be Timestamp(TimeUnit::Nanosecond,_) or FixedSizeBinary(12)"
-                ),
-            },
+            PhysicalType::INT96 => Arc::new(FixedSizeBinaryArray::from(array_data)),
             PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
                 unreachable!("PrimitiveArrayReaders don't support complex physical types");
             }
@@ -234,6 +210,40 @@ where
         // - date64: cast int32 to date32, then date32 to date64.
         // - decimal: cast int32 to decimal, int64 to decimal
         let array = match target_type {
+            ArrowType::Timestamp(TimeUnit::Second, _) => {
+                // TODO: Make it a s, None first.
+                arrow_cast::cast(&array, target_type)?
+            }
+            ArrowType::Timestamp(TimeUnit::Millisecond, _) => {
+                // TODO: Make it a ms, None first.
+                arrow_cast::cast(&array, target_type)?
+            }
+            ArrowType::Timestamp(TimeUnit::Microsecond, _) => {
+                // TODO: Make it a us, None first.
+                arrow_cast::cast(&array, target_type)?
+            }
+            ArrowType::Timestamp(TimeUnit::Nanosecond, _) => {
+                // TODO: Make it a ns, None first.
+                let mut builder = TimestampNanosecondBuilder::with_capacity(array.len());
+
+                let fsb_buffer = array.as_fixed_size_binary();
+                let mut temp_int96: Int96 = Int96::new();
+                // TODO: Can you take the null buffer from the existing FSB array?
+                for thing in fsb_buffer {
+                    match thing {
+                        None => {
+                            builder.append_null();
+                        }
+                        Some(bytes) => {
+                            temp_int96.set_bytes(bytes);
+                            builder.append_value(temp_int96.to_nanos());
+                        }
+                    }
+                }
+
+                let array = Arc::new(builder.finish()) as ArrayRef;
+                arrow_cast::cast(&array, target_type)?
+            }
             ArrowType::Date64 if *(array.data_type()) == ArrowType::Int32 => {
                 // this is cheap as it internally reinterprets the data
                 let a = arrow_cast::cast(&array, &ArrowType::Date32)?;
