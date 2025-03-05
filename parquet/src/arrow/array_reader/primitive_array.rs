@@ -60,7 +60,6 @@ impl IntoBuffer for Vec<Int96> {
     fn into_buffer(self) -> Buffer {
         let new_len = self.len() * 12;
         let mut data: Vec<u8>;
-        //TODO: Is there a more idiomatic zero-copy way to do this?
         unsafe {
             data = std::mem::transmute::<Vec<Int96>, Vec<u8>>(self);
             data.set_len(new_len);
@@ -218,7 +217,6 @@ where
 
                 let fsb_buffer = array.as_fixed_size_binary();
                 let mut temp_int96: Int96 = Int96::new();
-                // TODO: Can you take the null buffer from the existing FSB array?
                 for thing in fsb_buffer {
                     match thing {
                         None => {
