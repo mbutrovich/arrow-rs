@@ -209,21 +209,11 @@ where
         // These are:
         // - date64: cast int32 to date32, then date32 to date64.
         // - decimal: cast int32 to decimal, int64 to decimal
+        // - int96: convert to nanosecond precision timestamp i64. Related discussion:
+        //      - https://github.com/apache/arrow-rs/issues/982
+        //      - https://github.com/apache/arrow-rs/pull/2481
         let array = match target_type {
-            ArrowType::Timestamp(TimeUnit::Second, _) => {
-                // TODO: Make it a s, None first.
-                arrow_cast::cast(&array, target_type)?
-            }
-            ArrowType::Timestamp(TimeUnit::Millisecond, _) => {
-                // TODO: Make it a ms, None first.
-                arrow_cast::cast(&array, target_type)?
-            }
-            ArrowType::Timestamp(TimeUnit::Microsecond, _) => {
-                // TODO: Make it a us, None first.
-                arrow_cast::cast(&array, target_type)?
-            }
             ArrowType::Timestamp(TimeUnit::Nanosecond, _) => {
-                // TODO: Make it a ns, None first.
                 let mut builder = TimestampNanosecondBuilder::with_capacity(array.len());
 
                 let fsb_buffer = array.as_fixed_size_binary();
