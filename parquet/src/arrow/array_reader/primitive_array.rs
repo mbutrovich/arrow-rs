@@ -20,7 +20,7 @@ use crate::arrow::record_reader::RecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::Type as PhysicalType;
 use crate::column::page::PageIterator;
-use crate::data_type::{DataType, Int96};
+use crate::data_type::{AsBytes, DataType, Int96};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use arrow_array::{
@@ -58,12 +58,10 @@ impl IntoBuffer for Vec<bool> {
 
 impl IntoBuffer for Vec<Int96> {
     fn into_buffer(self) -> Buffer {
-        let new_len = self.len() * 12;
-        let mut data: Vec<u8>;
-        unsafe {
-            data = std::mem::transmute::<Vec<Int96>, Vec<u8>>(self);
-            data.set_len(new_len);
-        }
+        let mut data = Vec::<u8>::with_capacity(self.len() * 12);
+        self.iter()
+            .for_each(|value| value.as_bytes().iter().for_each(|b| data.push(*b)));
+        assert_eq!(data.len(), self.len() * 12);
         data.into_buffer()
     }
 }
