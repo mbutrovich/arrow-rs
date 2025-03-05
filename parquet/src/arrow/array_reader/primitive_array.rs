@@ -212,7 +212,9 @@ where
         //      - https://github.com/apache/arrow-rs/issues/982
         //      - https://github.com/apache/arrow-rs/pull/2481
         let array = match target_type {
-            ArrowType::Timestamp(TimeUnit::Nanosecond, _) => {
+            ArrowType::Timestamp(TimeUnit::Nanosecond, _)
+                if T::get_physical_type() == PhysicalType::INT96 =>
+            {
                 // Build up Timestamp Array from FixedSizeBinary Array by converting each element.
                 let mut builder = TimestampNanosecondBuilder::with_capacity(array.len());
                 let fsb_array = array.as_fixed_size_binary();
