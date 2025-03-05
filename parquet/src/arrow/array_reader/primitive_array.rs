@@ -213,12 +213,12 @@ where
         //      - https://github.com/apache/arrow-rs/pull/2481
         let array = match target_type {
             ArrowType::Timestamp(TimeUnit::Nanosecond, _) => {
+                // Build up Timestamp Array from FixedSizeBinary Array by converting each element.
                 let mut builder = TimestampNanosecondBuilder::with_capacity(array.len());
-
-                let fsb_buffer = array.as_fixed_size_binary();
-                let mut temp_int96: Int96 = Int96::new();
-                for thing in fsb_buffer {
-                    match thing {
+                let fsb_array = array.as_fixed_size_binary();
+                let mut temp_int96 = Int96::new();
+                for fsb in fsb_array {
+                    match fsb {
                         None => {
                             builder.append_null();
                         }
