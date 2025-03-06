@@ -60,7 +60,7 @@ impl IntoBuffer for Vec<Int96> {
     fn into_buffer(self) -> Buffer {
         let mut data = Vec::<u8>::with_capacity(self.len() * 12);
         self.iter()
-            .for_each(|value| value.as_bytes().iter().for_each(|b| data.push(*b)));
+            .for_each(|value| data.extend_from_slice(value.as_bytes()));
         assert_eq!(data.len(), self.len() * 12);
         data.into_buffer()
     }

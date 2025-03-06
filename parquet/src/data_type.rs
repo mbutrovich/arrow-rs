@@ -60,9 +60,9 @@ impl Int96 {
     #[inline]
     pub fn set_bytes(&mut self, bytes: &[u8]) {
         assert_eq!(bytes.len(), 12);
-        let elem0 = u32::from_ne_bytes(bytes[0..4].try_into().unwrap());
+        let elem0 = u32::from_ne_bytes(bytes[..4].try_into().unwrap());
         let elem1 = u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
-        let elem2 = u32::from_ne_bytes(bytes[8..12].try_into().unwrap());
+        let elem2 = u32::from_ne_bytes(bytes[8..].try_into().unwrap());
         self.value = [elem0, elem1, elem2];
     }
 
