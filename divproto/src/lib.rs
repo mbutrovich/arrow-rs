@@ -574,3 +574,130 @@ impl BiasedPmod {
         if r >= self.n { r - self.n } else { r }
     }
 }
+
+/// Granlund-Montgomery round-up method for 32-bit dividends. Its high multiply is
+/// 32x32 to 64 bits, which has vector forms (NEON `umull`, x86 `vpmuludq`), so loops
+/// over it can vectorize.
+#[derive(Debug, Clone, Copy)]
+pub struct GmU32 {
+    d: u32,
+    m: u32,
+    sh1: u32,
+    sh2: u32,
+}
+
+impl GmU32 {
+    pub fn new(d: u32) -> Option<Self> {
+        if d == 0 {
+            return None;
+        }
+        let l = 32 - (d - 1).leading_zeros();
+        let hi = ((1u64 << l) - d as u64) as u32;
+        let m = ((((hi as u64) << 32) / d as u64) + 1) as u32;
+        let (sh1, sh2) = shifts(l);
+        Some(Self { d, m, sh1, sh2 })
+    }
+
+    #[inline(always)]
+    pub fn div(&self, n: u32) -> u32 {
+        let t = ((self.m as u64 * n as u64) >> 32) as u32;
+        (t + ((n - t) >> self.sh1)) >> self.sh2
+    }
+
+    #[inline(always)]
+    pub fn rem(&self, n: u32) -> u32 {
+        n - self.div(n) * self.d
+    }
+}
+
+/// Truncating `i32` division with the same results as `wrapping_div`, built on [`GmU32`].
+#[derive(Debug, Clone, Copy)]
+pub struct GmI32 {
+    gm: GmU32,
+    neg: bool,
+}
+
+impl GmI32 {
+    pub fn new(d: i32) -> Option<Self> {
+        Some(Self {
+            gm: GmU32::new(d.unsigned_abs())?,
+            neg: d < 0,
+        })
+    }
+
+    #[inline(always)]
+    pub fn div(&self, x: i32) -> i32 {
+        let q = self.gm.div(x.unsigned_abs()) as i32;
+        if (x < 0) != self.neg {
+            q.wrapping_neg()
+        } else {
+            q
+        }
+    }
+}
+
+/// `comet_pmod` with [`GmU32`], in the biased form of [`BiasedPmod`].
+#[derive(Debug, Clone, Copy)]
+pub struct BiasedGmPmod {
+    n: u32,
+    gm: GmU32,
+    offset: u32,
+}
+
+impl BiasedGmPmod {
+    pub fn new(n: u32) -> Option<Self> {
+        let gm = GmU32::new(n)?;
+        Some(Self {
+            n,
+            gm,
+            offset: n - ((1u32 << 31) % n),
+        })
+    }
+
+    #[inline(always)]
+    pub fn pmod(&self, hash: u32) -> u32 {
+        let r = self.gm.rem(hash ^ (1 << 31)) + self.offset;
+        if r >= self.n { r - self.n } else { r }
+    }
+}
+
+/// Out-of-line loops for inspecting the generated code with `cargo asm`.
+pub mod asm_probe {
+    use super::*;
+
+    #[inline(never)]
+    pub fn rem_hardware(xs: &[u32], out: &mut [u32], d: u32) {
+        for (o, x) in out.iter_mut().zip(xs) {
+            *o = x % d;
+        }
+    }
+
+    #[inline(never)]
+    pub fn rem_lemire(xs: &[u32], out: &mut [u32], d: u32, m: u64) {
+        for (o, x) in out.iter_mut().zip(xs) {
+            let low = m.wrapping_mul(*x as u64);
+            *o = ((low as u128 * d as u128) >> 64) as u32;
+        }
+    }
+
+    #[inline(never)]
+    pub fn rem_gm32(xs: &[u32], out: &mut [u32], d: &GmU32) {
+        for (o, x) in out.iter_mut().zip(xs) {
+            *o = d.rem(*x);
+        }
+    }
+
+    #[inline(never)]
+    pub fn div_i32_gm32(xs: &[i32], out: &mut [i32], d: &GmI32) {
+        for (o, x) in out.iter_mut().zip(xs) {
+            *o = d.div(*x);
+        }
+    }
+
+    #[inline(never)]
+    pub fn pmod_gm32(xs: &[u32], out: &mut [u32], p: &BiasedGmPmod) {
+        for (o, x) in out.iter_mut().zip(xs) {
+            *o = p.pmod(*x);
+        }
+    }
+}

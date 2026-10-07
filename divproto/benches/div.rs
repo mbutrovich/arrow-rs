@@ -393,6 +393,254 @@ fn i128_narrow(c: &mut Criterion) {
     g.finish();
 }
 
+fn u32_vector(c: &mut Criterion) {
+    let mut g = c.benchmark_group("u32_vector");
+    g.throughput(Throughput::Elements(LEN as u64));
+    let mut rng = StdRng::seed_from_u64(13);
+    let xs: Vec<u32> = (0..LEN).map(|_| rng.r#gen()).collect();
+    let signed: Vec<i32> = xs.iter().map(|x| *x as i32).collect();
+    let mut out = vec![0u32; LEN];
+    let mut out_i = vec![0i32; LEN];
+    let mut out_us = vec![0usize; LEN];
+    for n in [13u32, 200, 1000] {
+        let d = black_box(n);
+        g.bench_function(BenchmarkId::new("rem_hardware", n), |b| {
+            b.iter(|| {
+                for (o, x) in out.iter_mut().zip(&xs) {
+                    *o = x % d;
+                }
+                black_box(&out);
+            })
+        });
+        let m = u64::MAX / d as u64 + 1;
+        g.bench_function(BenchmarkId::new("rem_lemire", n), |b| {
+            b.iter(|| {
+                for (o, x) in out.iter_mut().zip(&xs) {
+                    let low = m.wrapping_mul(*x as u64);
+                    *o = ((low as u128 * d as u128) >> 64) as u32;
+                }
+                black_box(&out);
+            })
+        });
+        let gm = GmU32::new(d).unwrap();
+        g.bench_function(BenchmarkId::new("rem_gm32", n), |b| {
+            b.iter(|| {
+                for (o, x) in out.iter_mut().zip(&xs) {
+                    *o = gm.rem(*x);
+                }
+                black_box(&out);
+            })
+        });
+        let sd = black_box(n as i32);
+        g.bench_function(BenchmarkId::new("div_i32_hardware", n), |b| {
+            b.iter(|| {
+                for (o, x) in out_i.iter_mut().zip(&signed) {
+                    *o = x.wrapping_div(sd);
+                }
+                black_box(&out_i);
+            })
+        });
+        let gmi = GmI32::new(sd).unwrap();
+        g.bench_function(BenchmarkId::new("div_i32_gm32", n), |b| {
+            b.iter(|| {
+                for (o, x) in out_i.iter_mut().zip(&signed) {
+                    *o = gmi.div(*x);
+                }
+                black_box(&out_i);
+            })
+        });
+        let nn = black_box(n as usize);
+        g.bench_function(BenchmarkId::new("pmod_one_div", n), |b| {
+            b.iter(|| {
+                for (o, x) in out_us.iter_mut().zip(&xs) {
+                    *o = comet_pmod_one_div(*x, nn);
+                }
+                black_box(&out_us);
+            })
+        });
+        let bl = BiasedPmod::new(d).unwrap();
+        g.bench_function(BenchmarkId::new("pmod_biased_lemire", n), |b| {
+            b.iter(|| {
+                for (o, x) in out.iter_mut().zip(&xs) {
+                    *o = bl.pmod(*x);
+                }
+                black_box(&out);
+            })
+        });
+        let bg = BiasedGmPmod::new(d).unwrap();
+        g.bench_function(BenchmarkId::new("pmod_biased_gm32", n), |b| {
+            b.iter(|| {
+                for (o, x) in out.iter_mut().zip(&xs) {
+                    *o = bg.pmod(*x);
+                }
+                black_box(&out);
+            })
+        });
+    }
+    g.finish();
+}
+
+fn batches(c: &mut Criterion) {
+    use arrow_arith::numeric::{div, rem};
+    use arrow_array::types::{Decimal128Type, Int32Type, UInt32Type, UInt64Type};
+    use arrow_array::{Decimal128Array, Int32Array, Scalar, UInt32Array, UInt64Array};
+
+    let mut g = c.benchmark_group("batches");
+    let mut rng = StdRng::seed_from_u64(14);
+    let u32s = UInt32Array::from_iter_values((0..LEN).map(|_| rng.r#gen::<u32>()));
+    let i32s = Int32Array::from_iter_values((0..LEN).map(|_| rng.r#gen::<i32>()));
+    let u64s = UInt64Array::from_iter_values((0..LEN).map(|_| rng.r#gen::<u64>()));
+
+    for n in [13u32, 16, 200] {
+        let scalar = Scalar::new(UInt32Array::from(vec![n]));
+        g.bench_function(BenchmarkId::new("u32_rem/arrow_rem", n), |b| {
+            b.iter(|| black_box(rem(&u32s, &scalar).unwrap()))
+        });
+        if n.is_power_of_two() {
+            let mask = n - 1;
+            g.bench_function(BenchmarkId::new("u32_rem/mask", n), |b| {
+                b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|x| x & mask)))
+            });
+        } else {
+            let d = black_box(n);
+            let m = u64::MAX / d as u64 + 1;
+            g.bench_function(BenchmarkId::new("u32_rem/lemire", n), |b| {
+                b.iter(|| {
+                    black_box(u32s.unary::<_, UInt32Type>(|x| {
+                        let low = m.wrapping_mul(x as u64);
+                        ((low as u128 * d as u128) >> 64) as u32
+                    }))
+                })
+            });
+            let gm = GmU32::new(d).unwrap();
+            g.bench_function(BenchmarkId::new("u32_rem/gm32", n), |b| {
+                b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|x| gm.rem(x))))
+            });
+        }
+
+        let scalar = Scalar::new(Int32Array::from(vec![n as i32]));
+        g.bench_function(BenchmarkId::new("i32_div/arrow_div", n), |b| {
+            b.iter(|| black_box(div(&i32s, &scalar).unwrap()))
+        });
+        let gmi = GmI32::new(black_box(n as i32)).unwrap();
+        g.bench_function(BenchmarkId::new("i32_div/gm32", n), |b| {
+            b.iter(|| black_box(i32s.unary::<_, Int32Type>(|x| gmi.div(x))))
+        });
+
+        let scalar = Scalar::new(UInt64Array::from(vec![n as u64]));
+        g.bench_function(BenchmarkId::new("u64_rem/arrow_rem", n), |b| {
+            b.iter(|| black_box(rem(&u64s, &scalar).unwrap()))
+        });
+        match LemireU64::new(black_box(n as u64)) {
+            LemireU64::PowerOfTwo { mask } => {
+                g.bench_function(BenchmarkId::new("u64_rem/mask", n), |b| {
+                    b.iter(|| black_box(u64s.unary::<_, UInt64Type>(|x| x & mask)))
+                });
+            }
+            LemireU64::Reciprocal {
+                divisor,
+                reciprocal,
+            } => {
+                g.bench_function(BenchmarkId::new("u64_rem/lemire", n), |b| {
+                    b.iter(|| {
+                        black_box(u64s.unary::<_, UInt64Type>(|x| {
+                            x - LemireU64::quotient(x, reciprocal) * divisor
+                        }))
+                    })
+                });
+                let gm = GmU64::new(divisor).unwrap();
+                g.bench_function(BenchmarkId::new("u64_rem/gm64", n), |b| {
+                    b.iter(|| black_box(u64s.unary::<_, UInt64Type>(|x| gm.div_rem(x).1)))
+                });
+            }
+        }
+
+        let nn = black_box(n);
+        g.bench_function(BenchmarkId::new("pmod/comet_today", n), |b| {
+            b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|h| comet_pmod(h, nn as usize) as u32)))
+        });
+        g.bench_function(BenchmarkId::new("pmod/one_div", n), |b| {
+            b.iter(|| {
+                black_box(
+                    u32s.unary::<_, UInt32Type>(|h| comet_pmod_one_div(h, nn as usize) as u32),
+                )
+            })
+        });
+        if n.is_power_of_two() {
+            let mask = n - 1;
+            g.bench_function(BenchmarkId::new("pmod/mask", n), |b| {
+                b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|h| h & mask)))
+            });
+        } else {
+            let bl = BiasedPmod::new(nn).unwrap();
+            g.bench_function(BenchmarkId::new("pmod/biased_lemire", n), |b| {
+                b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|h| bl.pmod(h))))
+            });
+            let bg = BiasedGmPmod::new(nn).unwrap();
+            g.bench_function(BenchmarkId::new("pmod/biased_gm32", n), |b| {
+                b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|h| bg.pmod(h))))
+            });
+        }
+    }
+
+    // Half-up rounded quotient, as in the decimal downscale
+    for digits in [18u32, 38] {
+        let values: Decimal128Array = (0..LEN)
+            .map(|_| Some(random_digits(&mut rng, digits)))
+            .collect();
+        let values = values.with_precision_and_scale(38, 0).unwrap();
+        for k in [4u32, 18] {
+            let id = format!("{digits}d/10^{k}");
+            let d = black_box(10i128.pow(k));
+            let half = d / 2;
+            let round = move |(q, r): (i128, i128)| {
+                if r >= half {
+                    q + 1
+                } else if r <= -half {
+                    q - 1
+                } else {
+                    q
+                }
+            };
+            g.bench_function(BenchmarkId::new("i128_round/hardware_i128", &id), |b| {
+                b.iter(|| black_box(values.unary::<_, Decimal128Type>(|x| round((x / d, x % d)))))
+            });
+            let gm = GmI128::<false>::new(d).unwrap();
+            g.bench_function(BenchmarkId::new("i128_round/gm128", &id), |b| {
+                b.iter(|| black_box(values.unary::<_, Decimal128Type>(|x| round(gm.div_rem(x)))))
+            });
+            if digits <= 18 {
+                let d64 = d as u64;
+                g.bench_function(BenchmarkId::new("i128_round/narrow_hw_u64", &id), |b| {
+                    b.iter(|| {
+                        black_box(values.unary::<_, Decimal128Type>(|x| {
+                            round(narrow_hw_div_rem(x, d64, false))
+                        }))
+                    })
+                });
+                let gm64 = GmU64::new(d64).unwrap();
+                g.bench_function(BenchmarkId::new("i128_round/narrow_gm64", &id), |b| {
+                    b.iter(|| {
+                        black_box(values.unary::<_, Decimal128Type>(|x| {
+                            round(narrow_gm_div_rem(x, gm64, false))
+                        }))
+                    })
+                });
+                let l = LemireDivU64::new(d64).unwrap();
+                g.bench_function(BenchmarkId::new("i128_round/narrow_lemire", &id), |b| {
+                    b.iter(|| {
+                        black_box(values.unary::<_, Decimal128Type>(|x| {
+                            round(narrow_lemire_div_rem(x, l, false))
+                        }))
+                    })
+                });
+            }
+        }
+    }
+    g.finish();
+}
+
 criterion_group!(benches, u64_rem, i128_div_rem, i256_div_rem, construct);
-criterion_group!(more, u32_pmod, u32_rem, i128_narrow);
-criterion_main!(benches, more);
+criterion_group!(more, u32_pmod, u32_rem, i128_narrow, u32_vector);
+criterion_group!(arrow_batches, batches);
+criterion_main!(benches, more, arrow_batches);
