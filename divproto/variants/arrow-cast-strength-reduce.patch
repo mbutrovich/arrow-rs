@@ -1,0 +1,357 @@
+diff --git a/arrow-cast/Cargo.toml b/arrow-cast/Cargo.toml
+index 4f1e7bad6..513316c31 100644
+--- a/arrow-cast/Cargo.toml
++++ b/arrow-cast/Cargo.toml
+@@ -52,6 +52,7 @@ atoi = "3.1.0"
+ comfy-table = { version = "8", optional = true, default-features = false }
+ base64 = "0.23"
+ ryu = "1.0.16"
++strength_reduce = { version = "0.2.4", default-features = false }
+ 
+ [dev-dependencies]
+ # Enable `chrono-tz` so that tests can exercise IANA (named) timezones such as
+diff --git a/arrow-cast/src/cast/decimal.rs b/arrow-cast/src/cast/decimal.rs
+index fd8b6562e..992e94d05 100644
+--- a/arrow-cast/src/cast/decimal.rs
++++ b/arrow-cast/src/cast/decimal.rs
+@@ -17,6 +17,7 @@
+ 
+ use crate::cast::*;
+ use crate::parse::{DecimalParseError, parse_decimal_checked};
++use strength_reduce::StrengthReducedU128;
+ 
+ /// A utility trait that provides checked conversions between
+ /// decimal types inspired by [`NumCast`]
+@@ -63,86 +64,6 @@ pub trait DecimalCast: Sized {
+         assert!(!divisor.is_zero(), "division by zero");
+         move |x| (x.div_wrapping(divisor), x.mod_wrapping(divisor))
+     }
+-
+-    /// As [`Self::div_rem_by`], for callers that have checked with [`Self::all_narrow`]
+-    /// that every dividend fits in 64 bits.
+-    fn div_rem_narrow_by(divisor: Self) -> impl Fn(Self) -> (Self, Self) + Copy
+-    where
+-        Self: ArrowNativeTypeOp,
+-    {
+-        Self::div_rem_by(divisor)
+-    }
+-
+-    /// Returns true if every value in `values` has a magnitude below 2^64 and
+-    /// [`Self::div_rem_narrow_by`] is cheaper than [`Self::div_rem_by`] for it.
+-    fn all_narrow(_values: &[Self]) -> bool {
+-        false
+-    }
+-}
+-
+-/// High 128 bits of a 128x128-bit product.
+-#[inline(always)]
+-fn mulhi_u128(a: u128, b: u128) -> u128 {
+-    let (a0, a1) = (a as u64 as u128, a >> 64);
+-    let (b0, b1) = (b as u64 as u128, b >> 64);
+-    let p01 = a0 * b1;
+-    let p10 = a1 * b0;
+-    let mid = ((a0 * b0) >> 64) + (p01 as u64 as u128) + (p10 as u64 as u128);
+-    a1 * b1 + (p01 >> 64) + (p10 >> 64) + (mid >> 64)
+-}
+-
+-/// Unsigned division by an invariant divisor with the Granlund-Montgomery round-up method
+-/// (Hacker's Delight 2nd ed., chapter 10): one 128-bit magic number, no per-divisor branch.
+-#[derive(Clone, Copy)]
+-struct GmU128 {
+-    d: u128,
+-    m: u128,
+-    sh1: u32,
+-    sh2: u32,
+-}
+-
+-impl GmU128 {
+-    fn new(d: u128) -> Self {
+-        assert_ne!(d, 0, "division by zero");
+-        let l = 128 - (d - 1).leading_zeros();
+-        // 2^l - d < 2^127, so it is a non-negative high limb of an i256
+-        let hi = if l == 128 {
+-            0u128.wrapping_sub(d)
+-        } else {
+-            (1u128 << l) - d
+-        };
+-        let q = i256::from_parts(0, hi as i128).wrapping_div(i256::from_parts(d, 0));
+-        Self {
+-            d,
+-            m: q.to_parts().0.wrapping_add(1),
+-            sh1: l.min(1),
+-            sh2: l.saturating_sub(1),
+-        }
+-    }
+-
+-    #[inline(always)]
+-    fn div_rem(&self, n: u128) -> (u128, u128) {
+-        let t = mulhi_u128(self.m, n);
+-        let q = (t + ((n - t) >> self.sh1)) >> self.sh2;
+-        (q, n - q * self.d)
+-    }
+-}
+-
+-/// Applies truncating-division signs to the quotient and remainder of `|x| / |divisor|`.
+-/// `as` wraps `i128::MIN / -1` like `div_wrapping` does.
+-#[inline(always)]
+-fn signed_div_rem(x: i128, divisor: i128, (q, r): (u128, u128)) -> (i128, i128) {
+-    let q = if x.is_negative() != divisor.is_negative() {
+-        (q as i128).wrapping_neg()
+-    } else {
+-        q as i128
+-    };
+-    let r = if x.is_negative() {
+-        (r as i128).wrapping_neg()
+-    } else {
+-        r as i128
+-    };
+-    (q, r)
+ }
+ 
+ impl DecimalCast for i32 {
+@@ -224,32 +145,24 @@ impl DecimalCast for i128 {
+         n.to_i128()
+     }
+ 
++    /// Divides magnitudes by a precomputed reciprocal of `|divisor|`, avoiding a call to
++    /// the 128-bit division routine for every value.
+     fn div_rem_by(divisor: Self) -> impl Fn(Self) -> (Self, Self) + Copy {
+-        let gm = GmU128::new(divisor.unsigned_abs());
+-        move |x| signed_div_rem(x, divisor, gm.div_rem(x.unsigned_abs()))
+-    }
+-
+-    fn div_rem_narrow_by(divisor: Self) -> impl Fn(Self) -> (Self, Self) + Copy {
+-        assert_ne!(divisor, 0, "division by zero");
+-        let d = u64::try_from(divisor.unsigned_abs()).ok();
++        let reduced = StrengthReducedU128::new(divisor.unsigned_abs());
+         move |x| {
+-            debug_assert_eq!(x.unsigned_abs() >> 64, 0);
+-            let n = x.unsigned_abs() as u64;
+-            let qr = match d {
+-                Some(d) => ((n / d) as u128, (n % d) as u128),
+-                // The divisor exceeds every 64-bit dividend
+-                None => (0, n as u128),
++            let (q, r) = StrengthReducedU128::div_rem(x.unsigned_abs(), reduced);
++            // Truncated division: the quotient is negative when the signs differ, and the
++            // remainder takes the sign of the dividend. `as` wraps i128::MIN / -1 like
++            // `div_wrapping` does.
++            let q = if x.is_negative() != divisor.is_negative() {
++                (q as i128).wrapping_neg()
++            } else {
++                q as i128
+             };
+-            signed_div_rem(x, divisor, qr)
++            let r = if x.is_negative() { -(r as i128) } else { r as i128 };
++            (q, r)
+         }
+     }
+-
+-    fn all_narrow(values: &[Self]) -> bool {
+-        values
+-            .iter()
+-            .fold(0, |acc, x| acc | (x.unsigned_abs() >> 64))
+-            == 0
+-    }
+ }
+ 
+ impl DecimalCast for i256 {
+@@ -340,12 +253,11 @@ where
+ /// available precision). Callers should therefore produce zero values (preserving nulls) rather
+ /// than returning an error.
+ #[expect(clippy::type_complexity)]
+-fn make_downscaler<I: DecimalType, O: DecimalType, F, D>(
++fn make_downscaler<I: DecimalType, O: DecimalType>(
+     input_precision: u8,
+     input_scale: i8,
+     output_precision: u8,
+     output_scale: i8,
+-    make_div_rem: F,
+ ) -> Option<(
+     impl Fn(I::Native) -> Option<O::Native>,
+     Option<impl Fn(I::Native) -> O::Native>,
+@@ -353,8 +265,6 @@ fn make_downscaler<I: DecimalType, O: DecimalType, F, D>(
+ where
+     I::Native: DecimalCast + ArrowNativeTypeOp,
+     O::Native: DecimalCast + ArrowNativeTypeOp,
+-    F: FnOnce(I::Native) -> D,
+-    D: Fn(I::Native) -> (I::Native, I::Native) + Copy,
+ {
+     let delta_scale = input_scale as i16 - output_scale as i16;
+ 
+@@ -369,7 +279,7 @@ where
+     let div = max.add_wrapping(I::Native::ONE);
+     let half = div.div_wrapping(I::Native::ONE.add_wrapping(I::Native::ONE));
+     let half_neg = half.neg_wrapping();
+-    let div_rem = make_div_rem(div);
++    let div_rem = I::Native::div_rem_by(div);
+ 
+     let f_fallible = move |x: I::Native| {
+         // div is >= 10 and so this cannot overflow
+@@ -453,13 +363,9 @@ where
+             make_upscaler::<I, O>(input_precision, input_scale, output_precision, output_scale)?;
+         apply_rescaler::<I, O>(value, output_precision, f, f_infallible)
+     } else {
+-        let Some((f, f_infallible)) = make_downscaler::<I, O, _, _>(
+-            input_precision,
+-            input_scale,
+-            output_precision,
+-            output_scale,
+-            I::Native::div_rem_by,
+-        ) else {
++        let Some((f, f_infallible)) =
++            make_downscaler::<I, O>(input_precision, input_scale, output_precision, output_scale)
++        else {
+             // Scale reduction exceeds supported precision; result mathematically rounds to zero
+             return Some(O::Native::ZERO);
+         };
+@@ -530,55 +436,9 @@ where
+     I::Native: DecimalCast + ArrowNativeTypeOp,
+     O::Native: DecimalCast + ArrowNativeTypeOp,
+ {
+-    // Choose the division method once per batch. `unary` also evaluates null slots, so the
+-    // check covers every value, not only the valid ones.
+-    if I::Native::all_narrow(array.values()) {
+-        downscale_with::<I, O, _, _>(
+-            array,
+-            input_precision,
+-            input_scale,
+-            output_precision,
+-            output_scale,
+-            cast_options,
+-            I::Native::div_rem_narrow_by,
+-        )
+-    } else {
+-        downscale_with::<I, O, _, _>(
+-            array,
+-            input_precision,
+-            input_scale,
+-            output_precision,
+-            output_scale,
+-            cast_options,
+-            I::Native::div_rem_by,
+-        )
+-    }
+-}
+-
+-fn downscale_with<I, O, F, D>(
+-    array: &PrimitiveArray<I>,
+-    input_precision: u8,
+-    input_scale: i8,
+-    output_precision: u8,
+-    output_scale: i8,
+-    cast_options: &CastOptions,
+-    make_div_rem: F,
+-) -> Result<PrimitiveArray<O>, ArrowError>
+-where
+-    I: DecimalType,
+-    O: DecimalType,
+-    I::Native: DecimalCast + ArrowNativeTypeOp,
+-    O::Native: DecimalCast + ArrowNativeTypeOp,
+-    F: FnOnce(I::Native) -> D,
+-    D: Fn(I::Native) -> (I::Native, I::Native) + Copy,
+-{
+-    if let Some((f_fallible, f_infallible)) = make_downscaler::<I, O, _, _>(
+-        input_precision,
+-        input_scale,
+-        output_precision,
+-        output_scale,
+-        make_div_rem,
+-    ) {
++    if let Some((f_fallible, f_infallible)) =
++        make_downscaler::<I, O>(input_precision, input_scale, output_precision, output_scale)
++    {
+         apply_decimal_cast(
+             array,
+             output_precision,
+@@ -1102,90 +962,11 @@ mod tests {
+         }
+     }
+ 
+-    #[test]
+-    fn test_div_rem_narrow_by_matches_wrapping_div_rem() {
+-        let mut divisors: Vec<i128> = (0..=38).map(|k| 10_i128.pow(k)).collect();
+-        divisors.extend(divisors.clone().iter().map(|d| -d));
+-        divisors.extend([
+-            2,
+-            3,
+-            7,
+-            u64::MAX as i128,
+-            1 << 64,
+-            (1 << 64) + 1,
+-            i128::MAX,
+-            i128::MIN,
+-        ]);
+-        let max = u64::MAX as i128;
+-        let values = [
+-            0,
+-            1,
+-            -1,
+-            9,
+-            -9,
+-            10,
+-            -10,
+-            10_i128.pow(18) - 1,
+-            1 - 10_i128.pow(18),
+-            max,
+-            -max,
+-            max - 1,
+-        ];
+-        for divisor in divisors {
+-            let div_rem = i128::div_rem_narrow_by(divisor);
+-            for value in values {
+-                let expected = (value.wrapping_div(divisor), value.wrapping_rem(divisor));
+-                assert_eq!(div_rem(value), expected, "{value} / {divisor}");
+-            }
+-        }
+-    }
+-
+-    #[test]
+-    fn test_all_narrow() {
+-        let max = u64::MAX as i128;
+-        assert!(i128::all_narrow(&[]));
+-        assert!(i128::all_narrow(&[0, max, -max]));
+-        assert!(!i128::all_narrow(&[0, max + 1]));
+-        assert!(!i128::all_narrow(&[-max - 1]));
+-        assert!(!i128::all_narrow(&[i128::MIN]));
+-        assert!(!i32::all_narrow(&[0]));
+-        assert!(!i256::all_narrow(&[i256::ZERO]));
+-    }
+-
+-    #[test]
+-    fn test_downscale_values_beyond_declared_precision() {
+-        // Declared precision does not bound the stored values, so the per-batch
+-        // check has to look at the values themselves
+-        let big = 10_i128.pow(30) + 5;
+-        let array = Decimal128Array::from(vec![Some(big), Some(-big), Some(123_456), None])
+-            .with_precision_and_scale(10, 4)
+-            .unwrap();
+-        let options = CastOptions {
+-            safe: true,
+-            ..Default::default()
+-        };
+-        let result = cast_with_options(&array, &DataType::Decimal128(38, 1), &options).unwrap();
+-        let result = result.as_primitive::<Decimal128Type>();
+-        assert_eq!(result.value(0), 10_i128.pow(27));
+-        assert_eq!(result.value(1), -10_i128.pow(27));
+-        assert_eq!(result.value(2), 123);
+-        assert!(result.is_null(3));
+-    }
+-
+     #[test]
+     fn test_div_rem_by_matches_wrapping_div_rem() {
+         let mut divisors: Vec<i128> = (0..=38).map(|k| 10_i128.pow(k)).collect();
+         divisors.extend(divisors.clone().iter().map(|d| -d));
+-        divisors.extend([
+-            2,
+-            3,
+-            7,
+-            1 << 64,
+-            (1 << 64) + 1,
+-            i128::MAX,
+-            i128::MIN,
+-            i128::MIN + 1,
+-        ]);
++        divisors.extend([2, 3, 7, 1 << 64, (1 << 64) + 1, i128::MAX, i128::MIN, i128::MIN + 1]);
+         let values = [
+             0,
+             1,

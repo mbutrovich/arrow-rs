@@ -101,3 +101,7 @@ harness = false
 [[bench]]
 name = "format_boolean"
 harness = false
+
+[[bench]]
+name = "decimal_downscale"
+harness = false

@@ -1,0 +1,428 @@
+diff --git a/native/spark-expr/benches/wide_decimal.rs b/native/spark-expr/benches/wide_decimal.rs
+index b38ddbfaa..c12037475 100644
+--- a/native/spark-expr/benches/wide_decimal.rs
++++ b/native/spark-expr/benches/wide_decimal.rs
+@@ -50,6 +50,22 @@ fn make_decimal_batch(p1: u8, s1: i8, p2: u8, s2: i8) -> RecordBatch {
+     RecordBatch::try_new(Arc::new(schema), vec![Arc::new(left), Arc::new(right)]).unwrap()
+ }
+ 
++fn make_decimal_batch_from(p1: u8, s1: i8, p2: u8, s2: i8, left_base: i128, right_base: i128) -> RecordBatch {
++    let mut left = Decimal128Builder::new();
++    let mut right = Decimal128Builder::new();
++    for i in 0..BATCH_SIZE as i128 {
++        left.append_value(left_base + i * 1000);
++        right.append_value(right_base - i * 1000);
++    }
++    let left = left.finish().with_data_type(DataType::Decimal128(p1, s1));
++    let right = right.finish().with_data_type(DataType::Decimal128(p2, s2));
++    let schema = Schema::new(vec![
++        Field::new("left", DataType::Decimal128(p1, s1), false),
++        Field::new("right", DataType::Decimal128(p2, s2), false),
++    ]);
++    RecordBatch::try_new(Arc::new(schema), vec![Arc::new(left), Arc::new(right)]).unwrap()
++}
++
+ fn make_overflow_batch(null_every: usize, overflow_every: usize) -> RecordBatch {
+     let left: Decimal128Array = (0..BATCH_SIZE)
+         .map(|i| {
+@@ -169,6 +185,24 @@ fn criterion_benchmark(c: &mut Criterion) {
+         bench_case(&mut group, "multiply", &batch, &old, &new);
+     }
+ 
++    // Case 3b: Multiply with products past i128 and a large quotient -
++    // Decimal128(38,10) * Decimal128(38,10) -> Decimal128(38,6), 24-digit operands
++    {
++        let batch = make_decimal_batch_from(38, 10, 38, 10, 123456789012345678901234, 987654321098765432109876);
++        let old = build_old_expr(38, 10, 38, 10, Operator::Multiply, DataType::Decimal128(38, 6));
++        let new = build_new_expr(WideDecimalOp::Multiply, 38, 6, EvalMode::Legacy);
++        bench_case(&mut group, "multiply_wide_big_quotient", &batch, &old, &new);
++    }
++
++    // Case 3c: Multiply with products past i128 and a small quotient -
++    // Decimal128(38,20) * Decimal128(38,20) -> Decimal128(38,6), 21-digit operands
++    {
++        let batch = make_decimal_batch_from(38, 20, 38, 20, 123456789012345678901, 987654321098765432109);
++        let old = build_old_expr(38, 20, 38, 20, Operator::Multiply, DataType::Decimal128(38, 6));
++        let new = build_new_expr(WideDecimalOp::Multiply, 38, 6, EvalMode::Legacy);
++        bench_case(&mut group, "multiply_wide_small_quotient", &batch, &old, &new);
++    }
++
+     // Case 4: Subtract with same scale - Decimal128(38,18) - Decimal128(38,18) -> Decimal128(38,18)
+     {
+         let batch = make_decimal_batch(38, 18, 38, 18);
+diff --git a/native/spark-expr/src/math_funcs/wide_decimal_binary_expr.rs b/native/spark-expr/src/math_funcs/wide_decimal_binary_expr.rs
+index a501a0127..067368001 100644
+--- a/native/spark-expr/src/math_funcs/wide_decimal_binary_expr.rs
++++ b/native/spark-expr/src/math_funcs/wide_decimal_binary_expr.rs
+@@ -287,15 +287,8 @@ impl PhysicalExpr for WideDecimalBinaryExpr {
+                     i256::ONE
+                 };
+ 
+-                arrow::compute::kernels::arity::try_binary(left, right, |l, r| {
+-                    let raw = i256::from_i128(l).wrapping_mul(i256::from_i128(r));
+-                    let result = if need_scale_down {
+-                        div_round_half_up(raw, rescale_divisor)
+-                    } else if need_scale_up {
+-                        raw.wrapping_mul(scale_up_factor)
+-                    } else {
+-                        raw
+-                    };
++                let variant = std::env::var("COMET_DIV_VARIANT").unwrap_or_default();
++                let finish = |raw: i256, result: i256| {
+                     check_overflow_and_convert(
+                         result,
+                         bound,
+@@ -308,7 +301,61 @@ impl PhysicalExpr for WideDecimalBinaryExpr {
+                         eval_mode,
+                         &overflowed,
+                     )
+-                })
++                };
++                match variant.as_str() {
++                    "one_knuth" => arrow::compute::kernels::arity::try_binary(left, right, |l, r| {
++                        let raw = i256::from_i128(l).wrapping_mul(i256::from_i128(r));
++                        let result = if need_scale_down {
++                            invariant_div::rescale_one_knuth(raw, rescale_divisor)
++                        } else if need_scale_up {
++                            raw.wrapping_mul(scale_up_factor)
++                        } else {
++                            raw
++                        };
++                        finish(raw, result)
++                    }),
++                    "gm" | "gm_scan" => {
++                        let narrow = (variant == "gm_scan" && need_scale_down && scale_diff <= 38)
++                            .then(|| invariant_div::narrow_product_bound(left, right))
++                            .flatten();
++                        match narrow {
++                            Some(()) => {
++                                let d = 10_u128.pow(scale_diff as u32);
++                                let gm = invariant_div::GmU128::new(d);
++                                arrow::compute::kernels::arity::try_binary(left, right, |l, r| {
++                                    let raw = l.wrapping_mul(r);
++                                    let result = invariant_div::rescale_gm128(raw, &gm, d);
++                                    finish(i256::from_i128(raw), i256::from_i128(result))
++                                })
++                            }
++                            None => {
++                                let gm = invariant_div::GmI256::new(rescale_divisor);
++                                arrow::compute::kernels::arity::try_binary(left, right, |l, r| {
++                                    let raw = i256::from_i128(l).wrapping_mul(i256::from_i128(r));
++                                    let result = if need_scale_down {
++                                        invariant_div::rescale_gm256(raw, &gm, rescale_divisor)
++                                    } else if need_scale_up {
++                                        raw.wrapping_mul(scale_up_factor)
++                                    } else {
++                                        raw
++                                    };
++                                    finish(raw, result)
++                                })
++                            }
++                        }
++                    }
++                    _ => arrow::compute::kernels::arity::try_binary(left, right, |l, r| {
++                        let raw = i256::from_i128(l).wrapping_mul(i256::from_i128(r));
++                        let result = if need_scale_down {
++                            div_round_half_up(raw, rescale_divisor)
++                        } else if need_scale_up {
++                            raw.wrapping_mul(scale_up_factor)
++                        } else {
++                            raw
++                        };
++                        finish(raw, result)
++                    }),
++                }
+             }
+         };
+         let result = result.map_err(unwrap_arrow_external_error)?;
+@@ -443,6 +490,290 @@ fn spark_multiply_overflow_value(unscaled: &str, scale: i8) -> Result<String, Ar
+     Ok(format_decimal_str(&truncated, MC_PRECISION, new_scale))
+ }
+ 
++
++/// Prototype: division by the loop-invariant rescale divisor.
++mod invariant_div {
++    use super::div_round_half_up;
++    use arrow::array::{Array, Decimal128Array};
++    use arrow::datatypes::i256;
++
++    /// HALF_UP rounding of `value / divisor` from the truncated quotient and remainder,
++    /// for a positive divisor. Same results as `div_round_half_up`.
++    #[inline(always)]
++    fn round_half_up(value: i256, divisor: i256, quot: i256, rem: i256) -> i256 {
++        let abs_rem = if rem < i256::ZERO { rem.wrapping_neg() } else { rem };
++        if abs_rem >= divisor.wrapping_sub(abs_rem) {
++            if value < i256::ZERO {
++                quot.wrapping_sub(i256::ONE)
++            } else {
++                quot.wrapping_add(i256::ONE)
++            }
++        } else {
++            quot
++        }
++    }
++
++    /// One Algorithm D call, with the remainder from a multiply and subtract.
++    #[inline(always)]
++    pub fn rescale_one_knuth(value: i256, divisor: i256) -> i256 {
++        let quot = value / divisor;
++        let rem = value.wrapping_sub(quot.wrapping_mul(divisor));
++        round_half_up(value, divisor, quot, rem)
++    }
++
++    #[inline(always)]
++    pub fn rescale_gm256(value: i256, gm: &GmI256, divisor: i256) -> i256 {
++        let (quot, rem) = gm.div_rem(value);
++        round_half_up(value, divisor, quot, rem)
++    }
++
++    /// HALF_UP rounding of `value / d` on the magnitude, then the sign of `value`.
++    #[inline(always)]
++    pub fn rescale_gm128(value: i128, gm: &GmU128, d: u128) -> i128 {
++        let (q, r) = gm.div_rem(value.unsigned_abs());
++        let q = q + (r >= d - r) as u128;
++        if value < 0 { (q as i128).wrapping_neg() } else { q as i128 }
++    }
++
++    /// Returns `Some(())` if every product of a left and a right value fits in `i128`.
++    /// Checks every slot, including nulls, so it never depends on the declared precision.
++    pub fn narrow_product_bound(left: &Decimal128Array, right: &Decimal128Array) -> Option<()> {
++        let max_abs = |a: &Decimal128Array| {
++            a.values().iter().fold(0u128, |acc, v| acc.max(v.unsigned_abs()))
++        };
++        let product = max_abs(left).checked_mul(max_abs(right))?;
++        (product <= i128::MAX as u128).then_some(())
++    }
++
++    #[inline(always)]
++    fn mulhi_u128(a: u128, b: u128) -> u128 {
++        let (a0, a1) = (a as u64 as u128, a >> 64);
++        let (b0, b1) = (b as u64 as u128, b >> 64);
++        let p01 = a0 * b1;
++        let p10 = a1 * b0;
++        let mid = ((a0 * b0) >> 64) + (p01 as u64 as u128) + (p10 as u64 as u128);
++        a1 * b1 + (p01 >> 64) + (p10 >> 64) + (mid >> 64)
++    }
++
++    /// Granlund-Montgomery round-up method with a 128-bit magic number.
++    pub struct GmU128 {
++        d: u128,
++        m: u128,
++        sh1: u32,
++        sh2: u32,
++    }
++
++    impl GmU128 {
++        pub fn new(d: u128) -> Self {
++            assert_ne!(d, 0);
++            let l = 128 - (d - 1).leading_zeros();
++            let hi = if l == 128 { 0u128.wrapping_sub(d) } else { (1u128 << l) - d };
++            let q = i256::from_parts(0, hi as i128).wrapping_div(i256::from_parts(d, 0));
++            Self { d, m: q.to_parts().0.wrapping_add(1), sh1: l.min(1), sh2: l.saturating_sub(1) }
++        }
++
++        #[inline(always)]
++        pub fn div_rem(&self, n: u128) -> (u128, u128) {
++            let t = mulhi_u128(self.m, n);
++            let q = (t + ((n - t) >> self.sh1)) >> self.sh2;
++            (q, n - q * self.d)
++        }
++    }
++
++    type U256 = [u64; 4];
++
++    fn to_u256(x: i256) -> U256 {
++        let (lo, hi) = x.wrapping_abs().to_parts();
++        let hi = hi as u128;
++        [lo as u64, (lo >> 64) as u64, hi as u64, (hi >> 64) as u64]
++    }
++
++    fn from_u256(x: U256) -> i256 {
++        let lo = x[0] as u128 | (x[1] as u128) << 64;
++        let hi = x[2] as u128 | (x[3] as u128) << 64;
++        i256::from_parts(lo, hi as i128)
++    }
++
++    #[inline(always)]
++    fn sub(a: U256, b: U256) -> U256 {
++        let mut out = [0; 4];
++        let mut borrow = false;
++        for i in 0..4 {
++            let (v, b1) = a[i].overflowing_sub(b[i]);
++            let (v, b2) = v.overflowing_sub(borrow as u64);
++            out[i] = v;
++            borrow = b1 | b2;
++        }
++        out
++    }
++
++    #[inline(always)]
++    fn add(a: U256, b: U256) -> U256 {
++        let mut out = [0; 4];
++        let mut carry = false;
++        for i in 0..4 {
++            let (v, c1) = a[i].overflowing_add(b[i]);
++            let (v, c2) = v.overflowing_add(carry as u64);
++            out[i] = v;
++            carry = c1 | c2;
++        }
++        out
++    }
++
++    #[inline(always)]
++    fn shr(a: U256, sh: u32) -> U256 {
++        let words = (sh / 64) as usize;
++        let bits = sh % 64;
++        let mut out = [0; 4];
++        for i in 0..4 - words {
++            let lo = a[i + words] >> bits;
++            let hi = if bits != 0 && i + words + 1 < 4 { a[i + words + 1] << (64 - bits) } else { 0 };
++            out[i] = lo | hi;
++        }
++        out
++    }
++
++    #[inline(always)]
++    fn mul_lo(a: U256, b: U256) -> U256 {
++        let mut out = [0u64; 4];
++        for i in 0..4 {
++            let mut carry = 0u128;
++            for j in 0..4 - i {
++                let t = a[i] as u128 * b[j] as u128 + out[i + j] as u128 + carry;
++                out[i + j] = t as u64;
++                carry = t >> 64;
++            }
++        }
++        out
++    }
++
++    #[inline(always)]
++    fn mulhi(a: U256, b: U256) -> U256 {
++        let mut p = [0u64; 8];
++        for i in 0..4 {
++            let mut carry = 0u128;
++            for j in 0..4 {
++                let t = a[i] as u128 * b[j] as u128 + p[i + j] as u128 + carry;
++                p[i + j] = t as u64;
++                carry = t >> 64;
++            }
++            p[i + 4] = carry as u64;
++        }
++        [p[4], p[5], p[6], p[7]]
++    }
++
++    fn leading_zeros(a: U256) -> u32 {
++        for i in (0..4).rev() {
++            if a[i] != 0 {
++                return (3 - i as u32) * 64 + a[i].leading_zeros();
++            }
++        }
++        256
++    }
++
++    fn ge(a: U256, b: U256) -> bool {
++        for i in (0..4).rev() {
++            if a[i] != b[i] {
++                return a[i] > b[i];
++            }
++        }
++        true
++    }
++
++    fn div_shifted(mut r: U256, d: U256) -> U256 {
++        let mut q = [0u64; 4];
++        for _ in 0..256 {
++            let carry = r[3] >> 63;
++            r = [r[0] << 1, r[1] << 1 | r[0] >> 63, r[2] << 1 | r[1] >> 63, r[3] << 1 | r[2] >> 63];
++            q = [q[0] << 1, q[1] << 1 | q[0] >> 63, q[2] << 1 | q[1] >> 63, q[3] << 1 | q[2] >> 63];
++            if carry != 0 || ge(r, d) {
++                r = sub(r, d);
++                q[0] |= 1;
++            }
++        }
++        q
++    }
++
++    /// Granlund-Montgomery round-up method with a 256-bit magic number, signed.
++    pub struct GmI256 {
++        d: U256,
++        m: U256,
++        sh1: u32,
++        sh2: u32,
++        neg: bool,
++    }
++
++    impl GmI256 {
++        pub fn new(divisor: i256) -> Self {
++            assert_ne!(divisor, i256::ZERO);
++            let d = to_u256(divisor);
++            let l = 256 - leading_zeros(sub(d, [1, 0, 0, 0]));
++            let pow = if l == 256 {
++                [0; 4]
++            } else {
++                let mut p = [0u64; 4];
++                p[(l / 64) as usize] = 1 << (l % 64);
++                p
++            };
++            let m = add(div_shifted(sub(pow, d), d), [1, 0, 0, 0]);
++            Self { d, m, sh1: l.min(1), sh2: l.saturating_sub(1), neg: divisor < i256::ZERO }
++        }
++
++        #[inline(always)]
++        pub fn div_rem(&self, x: i256) -> (i256, i256) {
++            let n = to_u256(x);
++            let t = mulhi(self.m, n);
++            let q = shr(add(t, shr(sub(n, t), self.sh1)), self.sh2);
++            let r = sub(n, mul_lo(q, self.d));
++            let (q, r) = (from_u256(q), from_u256(r));
++            let q = if (x < i256::ZERO) != self.neg { q.wrapping_neg() } else { q };
++            let r = if x < i256::ZERO { r.wrapping_neg() } else { r };
++            (q, r)
++        }
++    }
++
++    #[cfg(test)]
++    mod tests {
++        use super::*;
++        use crate::math_funcs::wide_decimal_binary_expr::i256_pow10;
++
++        fn lcg(state: &mut u64) -> u64 {
++            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
++            *state
++        }
++
++        #[test]
++        fn rescale_variants_match_div_round_half_up() {
++            let mut state = 42u64;
++            let mut operands: Vec<i128> = vec![0, 1, -1, 5, -5, 10_i128.pow(38) - 1, 1 - 10_i128.pow(38)];
++            for digits in [1u32, 9, 15, 19, 20, 30, 38] {
++                for _ in 0..40 {
++                    let v = ((lcg(&mut state) as u128) << 64 | lcg(&mut state) as u128) % 10_u128.pow(digits);
++                    let v = v as i128;
++                    operands.push(if lcg(&mut state) & 1 == 0 { v } else { -v });
++                }
++            }
++            for k in 1..=76u32 {
++                let divisor = i256_pow10(k);
++                let gm = GmI256::new(divisor);
++                let gm128 = (k <= 38).then(|| GmU128::new(10_u128.pow(k)));
++                for &l in &operands {
++                    for &r in operands.iter().step_by(7) {
++                        let raw = i256::from_i128(l).wrapping_mul(i256::from_i128(r));
++                        let expected = div_round_half_up(raw, divisor);
++                        assert_eq!(rescale_one_knuth(raw, divisor), expected, "{raw} / 10^{k}");
++                        assert_eq!(rescale_gm256(raw, &gm, divisor), expected, "{raw} / 10^{k}");
++                        if let (Some(gm128), Some(p)) = (&gm128, l.checked_mul(r)) {
++                            let got = rescale_gm128(p, gm128, 10_u128.pow(k));
++                            assert_eq!(i256::from_i128(got), expected, "{p} / 10^{k}");
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
