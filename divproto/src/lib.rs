@@ -701,3 +701,81 @@ pub mod asm_probe {
         }
     }
 }
+
+impl LemireU32 {
+    /// The reciprocal method for any divisor of at least 2, including powers of two,
+    /// for measuring it against the mask.
+    pub fn reciprocal(d: u32) -> Option<Self> {
+        (d >= 2).then(|| Self::Reciprocal {
+            d,
+            m: u64::MAX / d as u64 + 1,
+        })
+    }
+}
+
+impl LemireDivU64 {
+    /// The reciprocal method for any divisor of at least 2, including powers of two.
+    pub fn reciprocal(d: u64) -> Option<Self> {
+        (d >= 2).then(|| Self::Reciprocal {
+            d,
+            m: u128::MAX / d as u128 + 1,
+        })
+    }
+}
+
+/// Truncating `i32` division with the same results as `wrapping_div`, using Lemire's
+/// quotient on the magnitude. It holds the reciprocal directly, so the per-row path has
+/// no branch on the divisor.
+#[derive(Debug, Clone, Copy)]
+pub struct LemireI32 {
+    m: u64,
+    neg: bool,
+}
+
+impl LemireI32 {
+    /// Returns `None` unless `|d| >= 2`.
+    pub fn new(d: i32) -> Option<Self> {
+        let abs = d.unsigned_abs();
+        (abs >= 2).then(|| Self {
+            m: u64::MAX / abs as u64 + 1,
+            neg: d < 0,
+        })
+    }
+
+    #[inline(always)]
+    pub fn div(&self, x: i32) -> i32 {
+        let q = ((self.m as u128 * x.unsigned_abs() as u128) >> 64) as i32;
+        if (x < 0) != self.neg {
+            q.wrapping_neg()
+        } else {
+            q
+        }
+    }
+}
+
+/// `comet_pmod` with Lemire's remainder in the biased form of [`BiasedPmod`]. It holds the
+/// reciprocal directly, so the per-row path has no branch on the divisor.
+#[derive(Debug, Clone, Copy)]
+pub struct BiasedLemirePmod {
+    n: u32,
+    m: u64,
+    offset: u32,
+}
+
+impl BiasedLemirePmod {
+    /// Returns `None` unless `n >= 2`.
+    pub fn new(n: u32) -> Option<Self> {
+        (n >= 2).then(|| Self {
+            n,
+            m: u64::MAX / n as u64 + 1,
+            offset: n - ((1u32 << 31) % n),
+        })
+    }
+
+    #[inline(always)]
+    pub fn pmod(&self, hash: u32) -> u32 {
+        let low = self.m.wrapping_mul((hash ^ (1 << 31)) as u64);
+        let r = ((low as u128 * self.n as u128) >> 64) as u32 + self.offset;
+        if r >= self.n { r - self.n } else { r }
+    }
+}

@@ -492,29 +492,29 @@ fn batches(c: &mut Criterion) {
     let u64s = UInt64Array::from_iter_values((0..LEN).map(|_| rng.r#gen::<u64>()));
 
     for n in [13u32, 16, 200] {
+        let d = black_box(n);
+
         let scalar = Scalar::new(UInt32Array::from(vec![n]));
         g.bench_function(BenchmarkId::new("u32_rem/arrow_rem", n), |b| {
             b.iter(|| black_box(rem(&u32s, &scalar).unwrap()))
         });
+        let m = u64::MAX / d as u64 + 1;
+        g.bench_function(BenchmarkId::new("u32_rem/lemire", n), |b| {
+            b.iter(|| {
+                black_box(u32s.unary::<_, UInt32Type>(|x| {
+                    let low = m.wrapping_mul(x as u64);
+                    ((low as u128 * d as u128) >> 64) as u32
+                }))
+            })
+        });
+        let gm = GmU32::new(d).unwrap();
+        g.bench_function(BenchmarkId::new("u32_rem/gm32", n), |b| {
+            b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|x| gm.rem(x))))
+        });
         if n.is_power_of_two() {
-            let mask = n - 1;
+            let mask = d - 1;
             g.bench_function(BenchmarkId::new("u32_rem/mask", n), |b| {
                 b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|x| x & mask)))
-            });
-        } else {
-            let d = black_box(n);
-            let m = u64::MAX / d as u64 + 1;
-            g.bench_function(BenchmarkId::new("u32_rem/lemire", n), |b| {
-                b.iter(|| {
-                    black_box(u32s.unary::<_, UInt32Type>(|x| {
-                        let low = m.wrapping_mul(x as u64);
-                        ((low as u128 * d as u128) >> 64) as u32
-                    }))
-                })
-            });
-            let gm = GmU32::new(d).unwrap();
-            g.bench_function(BenchmarkId::new("u32_rem/gm32", n), |b| {
-                b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|x| gm.rem(x))))
             });
         }
 
@@ -522,7 +522,11 @@ fn batches(c: &mut Criterion) {
         g.bench_function(BenchmarkId::new("i32_div/arrow_div", n), |b| {
             b.iter(|| black_box(div(&i32s, &scalar).unwrap()))
         });
-        let gmi = GmI32::new(black_box(n as i32)).unwrap();
+        let li = LemireI32::new(d as i32).unwrap();
+        g.bench_function(BenchmarkId::new("i32_div/lemire", n), |b| {
+            b.iter(|| black_box(i32s.unary::<_, Int32Type>(|x| li.div(x))))
+        });
+        let gmi = GmI32::new(d as i32).unwrap();
         g.bench_function(BenchmarkId::new("i32_div/gm32", n), |b| {
             b.iter(|| black_box(i32s.unary::<_, Int32Type>(|x| gmi.div(x))))
         });
@@ -531,54 +535,46 @@ fn batches(c: &mut Criterion) {
         g.bench_function(BenchmarkId::new("u64_rem/arrow_rem", n), |b| {
             b.iter(|| black_box(rem(&u64s, &scalar).unwrap()))
         });
-        match LemireU64::new(black_box(n as u64)) {
-            LemireU64::PowerOfTwo { mask } => {
-                g.bench_function(BenchmarkId::new("u64_rem/mask", n), |b| {
-                    b.iter(|| black_box(u64s.unary::<_, UInt64Type>(|x| x & mask)))
-                });
-            }
-            LemireU64::Reciprocal {
-                divisor,
-                reciprocal,
-            } => {
-                g.bench_function(BenchmarkId::new("u64_rem/lemire", n), |b| {
-                    b.iter(|| {
-                        black_box(u64s.unary::<_, UInt64Type>(|x| {
-                            x - LemireU64::quotient(x, reciprocal) * divisor
-                        }))
-                    })
-                });
-                let gm = GmU64::new(divisor).unwrap();
-                g.bench_function(BenchmarkId::new("u64_rem/gm64", n), |b| {
-                    b.iter(|| black_box(u64s.unary::<_, UInt64Type>(|x| gm.div_rem(x).1)))
-                });
-            }
-        }
-
-        let nn = black_box(n);
-        g.bench_function(BenchmarkId::new("pmod/comet_today", n), |b| {
-            b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|h| comet_pmod(h, nn as usize) as u32)))
-        });
-        g.bench_function(BenchmarkId::new("pmod/one_div", n), |b| {
+        let d64 = d as u64;
+        let reciprocal = u128::MAX / d64 as u128 + 1;
+        g.bench_function(BenchmarkId::new("u64_rem/lemire", n), |b| {
             b.iter(|| {
                 black_box(
-                    u32s.unary::<_, UInt32Type>(|h| comet_pmod_one_div(h, nn as usize) as u32),
+                    u64s.unary::<_, UInt64Type>(|x| x - LemireU64::quotient(x, reciprocal) * d64),
                 )
             })
         });
+        let gm64 = GmU64::new(d64).unwrap();
+        g.bench_function(BenchmarkId::new("u64_rem/gm64", n), |b| {
+            b.iter(|| black_box(u64s.unary::<_, UInt64Type>(|x| gm64.div_rem(x).1)))
+        });
         if n.is_power_of_two() {
-            let mask = n - 1;
+            let mask = d64 - 1;
+            g.bench_function(BenchmarkId::new("u64_rem/mask", n), |b| {
+                b.iter(|| black_box(u64s.unary::<_, UInt64Type>(|x| x & mask)))
+            });
+        }
+
+        let nn = d as usize;
+        g.bench_function(BenchmarkId::new("pmod/comet_today", n), |b| {
+            b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|h| comet_pmod(h, nn) as u32)))
+        });
+        g.bench_function(BenchmarkId::new("pmod/one_div", n), |b| {
+            b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|h| comet_pmod_one_div(h, nn) as u32)))
+        });
+        let bl = BiasedLemirePmod::new(d).unwrap();
+        g.bench_function(BenchmarkId::new("pmod/biased_lemire", n), |b| {
+            b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|h| bl.pmod(h))))
+        });
+        let bg = BiasedGmPmod::new(d).unwrap();
+        g.bench_function(BenchmarkId::new("pmod/biased_gm32", n), |b| {
+            b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|h| bg.pmod(h))))
+        });
+        if n.is_power_of_two() {
+            // Euclidean remainder by a power of two is a mask of the two's complement bits
+            let mask = d - 1;
             g.bench_function(BenchmarkId::new("pmod/mask", n), |b| {
                 b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|h| h & mask)))
-            });
-        } else {
-            let bl = BiasedPmod::new(nn).unwrap();
-            g.bench_function(BenchmarkId::new("pmod/biased_lemire", n), |b| {
-                b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|h| bl.pmod(h))))
-            });
-            let bg = BiasedGmPmod::new(nn).unwrap();
-            g.bench_function(BenchmarkId::new("pmod/biased_gm32", n), |b| {
-                b.iter(|| black_box(u32s.unary::<_, UInt32Type>(|h| bg.pmod(h))))
             });
         }
     }
