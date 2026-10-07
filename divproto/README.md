@@ -53,4 +53,4 @@ cd native
 COMET_DIV_VARIANT=gm_scan cargo bench -p datafusion-comet-spark-expr --bench wide_decimal -- "fused/multiply"
 ```
 
-The epic's numbers came from an Apple M5 Max on AC power with Low Power Mode off, under `caffeinate -i` so the machine stayed awake. `divproto` and Comet used rustc 1.98.1. Inside this repository `divproto` picks up the 1.99.0 toolchain from `rust-toolchain.toml`.
+The epic's numbers came from an Apple M5 Max. `divproto` and Comet used rustc 1.98.1. Inside this repository `divproto` picks up the 1.99.0 toolchain from `rust-toolchain.toml`.
