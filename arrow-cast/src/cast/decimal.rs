@@ -128,6 +128,36 @@ impl GmU128 {
     }
 }
 
+/// [`GmU128`] with a 64-bit magic number, for dividends that fit in 64 bits.
+#[derive(Clone, Copy)]
+struct GmU64 {
+    d: u64,
+    m: u64,
+    sh1: u32,
+    sh2: u32,
+}
+
+impl GmU64 {
+    fn new(d: u64) -> Self {
+        assert_ne!(d, 0, "division by zero");
+        let l = 64 - (d - 1).leading_zeros();
+        let hi = ((1u128 << l) - d as u128) as u64;
+        Self {
+            d,
+            m: ((((hi as u128) << 64) / d as u128) + 1) as u64,
+            sh1: l.min(1),
+            sh2: l.saturating_sub(1),
+        }
+    }
+
+    #[inline(always)]
+    fn div_rem(&self, n: u64) -> (u64, u64) {
+        let t = ((self.m as u128 * n as u128) >> 64) as u64;
+        let q = (t + ((n - t) >> self.sh1)) >> self.sh2;
+        (q, n - q * self.d)
+    }
+}
+
 /// Applies truncating-division signs to the quotient and remainder of `|x| / |divisor|`.
 /// `as` wraps `i128::MIN / -1` like `div_wrapping` does.
 #[inline(always)]
@@ -231,12 +261,15 @@ impl DecimalCast for i128 {
 
     fn div_rem_narrow_by(divisor: Self) -> impl Fn(Self) -> (Self, Self) + Copy {
         assert_ne!(divisor, 0, "division by zero");
-        let d = u64::try_from(divisor.unsigned_abs()).ok();
+        let gm = u64::try_from(divisor.unsigned_abs()).ok().map(GmU64::new);
         move |x| {
             debug_assert_eq!(x.unsigned_abs() >> 64, 0);
             let n = x.unsigned_abs() as u64;
-            let qr = match d {
-                Some(d) => ((n / d) as u128, (n % d) as u128),
+            let qr = match gm {
+                Some(gm) => {
+                    let (q, r) = gm.div_rem(n);
+                    (q as u128, r as u128)
+                }
                 // The divisor exceeds every 64-bit dividend
                 None => (0, n as u128),
             };

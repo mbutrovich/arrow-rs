@@ -1,8 +1,8 @@
 diff --git a/arrow-cast/src/cast/decimal.rs b/arrow-cast/src/cast/decimal.rs
-index fd8b6562e..795051f92 100644
+index ef2efb34d..641d4cc29 100644
 --- a/arrow-cast/src/cast/decimal.rs
 +++ b/arrow-cast/src/cast/decimal.rs
-@@ -532,7 +532,7 @@ where
+@@ -565,7 +565,7 @@ where
  {
      // Choose the division method once per batch. `unary` also evaluates null slots, so the
      // check covers every value, not only the valid ones.

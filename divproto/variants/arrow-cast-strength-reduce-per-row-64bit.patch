@@ -11,7 +11,7 @@ index 4f1e7bad6..513316c31 100644
  [dev-dependencies]
  # Enable `chrono-tz` so that tests can exercise IANA (named) timezones such as
 diff --git a/arrow-cast/src/cast/decimal.rs b/arrow-cast/src/cast/decimal.rs
-index fd8b6562e..2df283a5c 100644
+index ef2efb34d..2df283a5c 100644
 --- a/arrow-cast/src/cast/decimal.rs
 +++ b/arrow-cast/src/cast/decimal.rs
 @@ -17,6 +17,7 @@
@@ -22,7 +22,7 @@ index fd8b6562e..2df283a5c 100644
  
  /// A utility trait that provides checked conversions between
  /// decimal types inspired by [`NumCast`]
-@@ -63,86 +64,6 @@ pub trait DecimalCast: Sized {
+@@ -63,116 +64,6 @@ pub trait DecimalCast: Sized {
          assert!(!divisor.is_zero(), "division by zero");
          move |x| (x.div_wrapping(divisor), x.mod_wrapping(divisor))
      }
@@ -91,6 +91,36 @@ index fd8b6562e..2df283a5c 100644
 -    }
 -}
 -
+-/// [`GmU128`] with a 64-bit magic number, for dividends that fit in 64 bits.
+-#[derive(Clone, Copy)]
+-struct GmU64 {
+-    d: u64,
+-    m: u64,
+-    sh1: u32,
+-    sh2: u32,
+-}
+-
+-impl GmU64 {
+-    fn new(d: u64) -> Self {
+-        assert_ne!(d, 0, "division by zero");
+-        let l = 64 - (d - 1).leading_zeros();
+-        let hi = ((1u128 << l) - d as u128) as u64;
+-        Self {
+-            d,
+-            m: ((((hi as u128) << 64) / d as u128) + 1) as u64,
+-            sh1: l.min(1),
+-            sh2: l.saturating_sub(1),
+-        }
+-    }
+-
+-    #[inline(always)]
+-    fn div_rem(&self, n: u64) -> (u64, u64) {
+-        let t = ((self.m as u128 * n as u128) >> 64) as u64;
+-        let q = (t + ((n - t) >> self.sh1)) >> self.sh2;
+-        (q, n - q * self.d)
+-    }
+-}
+-
 -/// Applies truncating-division signs to the quotient and remainder of `|x| / |divisor|`.
 -/// `as` wraps `i128::MIN / -1` like `div_wrapping` does.
 -#[inline(always)]
@@ -109,7 +139,7 @@ index fd8b6562e..2df283a5c 100644
  }
  
  impl DecimalCast for i32 {
-@@ -224,32 +145,37 @@ impl DecimalCast for i128 {
+@@ -254,35 +145,37 @@ impl DecimalCast for i128 {
          n.to_i128()
      }
  
@@ -122,14 +152,17 @@ index fd8b6562e..2df283a5c 100644
 -
 -    fn div_rem_narrow_by(divisor: Self) -> impl Fn(Self) -> (Self, Self) + Copy {
 -        assert_ne!(divisor, 0, "division by zero");
--        let d = u64::try_from(divisor.unsigned_abs()).ok();
+-        let gm = u64::try_from(divisor.unsigned_abs()).ok().map(GmU64::new);
 +        let reduced = StrengthReducedU128::new(divisor.unsigned_abs());
 +        let divisor_u64 = u64::try_from(divisor.unsigned_abs()).ok();
          move |x| {
 -            debug_assert_eq!(x.unsigned_abs() >> 64, 0);
 -            let n = x.unsigned_abs() as u64;
--            let qr = match d {
--                Some(d) => ((n / d) as u128, (n % d) as u128),
+-            let qr = match gm {
+-                Some(gm) => {
+-                    let (q, r) = gm.div_rem(n);
+-                    (q as u128, r as u128)
+-                }
 -                // The divisor exceeds every 64-bit dividend
 -                None => (0, n as u128),
 +            let n = x.unsigned_abs();
@@ -140,7 +173,8 @@ index fd8b6562e..2df283a5c 100644
 +                // The divisor is at least 2^64, so it exceeds n
 +                (Ok(_), None) => (0, n),
 +                (Err(_), _) => StrengthReducedU128::div_rem(n, reduced),
-+            };
+             };
+-            signed_div_rem(x, divisor, qr)
 +            // Truncated division: the quotient is negative when the signs differ, and the
 +            // remainder takes the sign of the dividend. `as` wraps i128::MIN / -1 like
 +            // `div_wrapping` does.
@@ -153,8 +187,7 @@ index fd8b6562e..2df283a5c 100644
 +                -(r as i128)
 +            } else {
 +                r as i128
-             };
--            signed_div_rem(x, divisor, qr)
++            };
 +            (q, r)
          }
      }
@@ -168,7 +201,7 @@ index fd8b6562e..2df283a5c 100644
  }
  
  impl DecimalCast for i256 {
-@@ -340,12 +266,11 @@ where
+@@ -373,12 +266,11 @@ where
  /// available precision). Callers should therefore produce zero values (preserving nulls) rather
  /// than returning an error.
  #[expect(clippy::type_complexity)]
@@ -182,7 +215,7 @@ index fd8b6562e..2df283a5c 100644
  ) -> Option<(
      impl Fn(I::Native) -> Option<O::Native>,
      Option<impl Fn(I::Native) -> O::Native>,
-@@ -353,8 +278,6 @@ fn make_downscaler<I: DecimalType, O: DecimalType, F, D>(
+@@ -386,8 +278,6 @@ fn make_downscaler<I: DecimalType, O: DecimalType, F, D>(
  where
      I::Native: DecimalCast + ArrowNativeTypeOp,
      O::Native: DecimalCast + ArrowNativeTypeOp,
@@ -191,7 +224,7 @@ index fd8b6562e..2df283a5c 100644
  {
      let delta_scale = input_scale as i16 - output_scale as i16;
  
-@@ -369,7 +292,7 @@ where
+@@ -402,7 +292,7 @@ where
      let div = max.add_wrapping(I::Native::ONE);
      let half = div.div_wrapping(I::Native::ONE.add_wrapping(I::Native::ONE));
      let half_neg = half.neg_wrapping();
@@ -200,7 +233,7 @@ index fd8b6562e..2df283a5c 100644
  
      let f_fallible = move |x: I::Native| {
          // div is >= 10 and so this cannot overflow
-@@ -453,13 +376,9 @@ where
+@@ -486,13 +376,9 @@ where
              make_upscaler::<I, O>(input_precision, input_scale, output_precision, output_scale)?;
          apply_rescaler::<I, O>(value, output_precision, f, f_infallible)
      } else {
@@ -217,7 +250,7 @@ index fd8b6562e..2df283a5c 100644
              // Scale reduction exceeds supported precision; result mathematically rounds to zero
              return Some(O::Native::ZERO);
          };
-@@ -530,55 +449,9 @@ where
+@@ -563,55 +449,9 @@ where
      I::Native: DecimalCast + ArrowNativeTypeOp,
      O::Native: DecimalCast + ArrowNativeTypeOp,
  {
@@ -276,7 +309,7 @@ index fd8b6562e..2df283a5c 100644
          apply_decimal_cast(
              array,
              output_precision,
-@@ -1102,76 +975,6 @@ mod tests {
+@@ -1135,76 +975,6 @@ mod tests {
          }
      }
  
