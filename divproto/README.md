@@ -37,7 +37,7 @@ cargo test --release
 cargo bench --bench div
 ```
 
-The `batches` group runs each method on 8192-value Arrow arrays, through arrow-arith's kernels for today and `PrimitiveArray::unary` for the prototypes. The epic's integer, `pmod` and rounded-quotient tables come from that group.
+The `batches` group runs each method on 8192-value Arrow arrays, through arrow-arith's kernels for today and `PrimitiveArray::unary` for the prototypes. The epic's integer and `pmod` charts come from that group.
 
 The arrow-cast downscale, from the repository root. To measure another column, apply a patch first and remove it with `git checkout -- arrow-cast` afterwards:
 
